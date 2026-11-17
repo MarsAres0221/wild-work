@@ -14,7 +14,8 @@
 //	tools            仅非 DSML 模式下发
 //	messages         assistant 恒带 reasoning_content（缺失 → 400）；孤儿 tool_call/tool_result
 //	                 必须整对剔除（否则后端对该会话此后每条消息都回 400）；
-//	                 非 text 内容块丢弃
+//	                 非 text 内容块丢弃，**但** imageCapableModels 里的模型保留 image_url
+//	                 （deepseek-v4.1-flash 实测可识图，2026-11-17）
 //
 // deepseek-v4 的 **DSML 分支**（协议 §2.3）：`^deepseek-v4-(flash|pro)$` 的模型不下发
 // `tools`，改把工具 schema 以文本注入 system（位置：system 之后、user 之前），要求模型用
@@ -104,7 +105,7 @@ func buildChatBody(body []byte, model string, sessionID string) ([]byte, error) 
 	delete(obj, "reasoning")
 
 	if msgs, ok := obj["messages"].([]any); ok {
-		msgs = normalizeMessages(msgs)
+		msgs = normalizeMessages(msgs, model)
 		if isDSMLModel(model) {
 			msgs = applyDSML(msgs, obj)
 		}
@@ -155,17 +156,17 @@ func numberValue(raw any) float64 {
 }
 
 // normalizeMessages 出站消息归一（协议 §2.3「messages 序列化的硬约束」）：
-//  1. 非 text 内容块丢弃（图片等一律不发）；
+//  1. 内容块按模型过滤：默认只留 text；实测可识图模型保留 image_url；
 //  2. assistant 恒带 reasoning_content（缺失即补空串，否则上游 400）；
 //  3. 孤儿 tool_call / tool_result 整对剔除。
-func normalizeMessages(msgs []any) []any {
+func normalizeMessages(msgs []any, model string) []any {
 	for _, m := range msgs {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			continue
 		}
 		if blocks, ok := msg["content"].([]any); ok {
-			msg["content"] = textBlocksOnly(blocks)
+			msg["content"] = keepContentBlocks(blocks, model)
 		}
 		if role, _ := msg["role"].(string); role == "assistant" {
 			if _, has := msg["reasoning_content"]; !has {
@@ -176,16 +177,37 @@ func normalizeMessages(msgs []any) []any {
 	return cleanupOrphanToolCalls(msgs)
 }
 
-// textBlocksOnly 只保留 type=="text" 的内容块。
-func textBlocksOnly(blocks []any) []any {
+// imageCapableModels 实测确认 CodeArts 上游接受 image_url 并能正确识图的模型。
+//
+// 取证（2026-11-17，单发 A/B，同一张 640×320 PNG）：直连上游（绕过本函数的
+// 剥块逻辑）带图 → 200 且回答「7319,红色」并逐项描述画面（数字 7/3/1/9、右上
+// 深红圆点、深红边框、白底）；把图换成纯文本对照 → 「无法识别」。判据是「有图/
+// 无图对照」，不用「模型是否声称看到图」——那会被提示词带偏。
+//
+// 为什么按**模型**白名单而不是整渠道放开：同渠道的纯文本模型收到图片块会 400
+// （小浣熊侧 sn-glm-5-3 实测返回「当前纯文本模型不支持 image_url」，R140 同型坑）。
+// 未列入表的模型沿用旧行为（只留 text），零行为变化。
+var imageCapableModels = map[string]bool{
+	"deepseek-v4.1-flash": true,
+}
+
+// keepContentBlocks 按模型保留内容块：text 恒留；image_url/input_image 仅当
+// 该模型在 imageCapableModels 里才留（其余一律丢弃，图片等不发上游）。
+func keepContentBlocks(blocks []any, model string) []any {
+	allowImage := imageCapableModels[bareModelName(model)]
 	out := make([]any, 0, len(blocks))
 	for _, b := range blocks {
 		blk, ok := b.(map[string]any)
 		if !ok {
 			continue
 		}
-		if t, _ := blk["type"].(string); t == "text" {
+		switch t, _ := blk["type"].(string); t {
+		case "text":
 			out = append(out, blk)
+		case "image_url", "input_image":
+			if allowImage {
+				out = append(out, blk)
+			}
 		}
 	}
 	return out
